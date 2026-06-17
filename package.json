@@ -1,0 +1,28 @@
+{
+  "name": "perihelion",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Intent-based cross-chain bridge protocol connecting Stellar to EVM networks",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/perihelion-protocol/perihelion.git"
+  },
+  "workspaces": [
+    "sdk",
+    "relayer",
+    "solver"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "clean": "npm run clean --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

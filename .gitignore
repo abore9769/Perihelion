@@ -1,0 +1,26 @@
+# Node
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+npm-debug.log*
+
+# Rust / Soroban
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Foundry
+contracts/evm/out/
+contracts/evm/cache/
+contracts/evm/broadcast/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
