@@ -1,0 +1,37 @@
+name: ✨ Feature Request
+description: Propose a new feature or enhancement
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem does this solve? Who benefits?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the feature. Note if it touches on-chain formats or trust assumptions.
+    validations:
+      required: true
+  - type: dropdown
+    id: track
+    attributes:
+      label: Skill track
+      options:
+        - Rust / Soroban
+        - Solidity
+        - TypeScript
+        - Documentation
+        - Cross-cutting / unsure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

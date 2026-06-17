@@ -1,0 +1,57 @@
+name: 🐛 Bug Report
+description: Report a defect in a Perihelion component
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug! For **security vulnerabilities**, do not use
+        this form — follow [SECURITY.md](../../SECURITY.md) instead.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of the monorepo is affected?
+      options:
+        - contracts/soroban (Rust)
+        - contracts/evm (Solidity)
+        - sdk
+        - solver
+        - relayer
+        - docs
+        - other / unsure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Ideally a failing test or minimal repro.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Node version, Rust/soroban-sdk version, Foundry version, network.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      render: shell
+    validations:
+      required: false
