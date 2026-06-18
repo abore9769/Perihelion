@@ -337,3 +337,67 @@ fn cancel_intent_payload_layout() {
     assert_eq!(b.get(1).unwrap(), MSG_CANCEL_INTENT);
     assert_eq!(b.get(34).unwrap(), CANCEL_REASON_EXPIRED);
 }
+
+// --- Cross-chain wire-format conformance --------------------------------------
+//
+// These assert the encoder emits the exact golden bytes in
+// `contracts/shared/wire-vectors/`. The EVM decoder has a matching test reading
+// the same files, so the two stacks cannot drift apart silently. Keep the inputs
+// here in lockstep with the documented canonical values in the vectors README.
+
+const FILL_CONFIRMED_GOLDEN: &str = include_str!("../../../shared/wire-vectors/fill_confirmed.hex");
+const CANCEL_INTENT_GOLDEN: &str = include_str!("../../../shared/wire-vectors/cancel_intent.hex");
+
+/// Core-only hex decode of an `0x`-prefixed vector into a fixed-size array.
+fn decode_vector<const N: usize>(s: &str) -> [u8; N] {
+    let s = s.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let chars = s.as_bytes();
+    assert_eq!(chars.len(), 2 * N, "vector length mismatch");
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = (nibble(chars[2 * i]) << 4) | nibble(chars[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+fn nibble(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => panic!("non-hex character in vector"),
+    }
+}
+
+fn assert_bytes_eq(actual: &soroban_sdk::Bytes, expected: &[u8]) {
+    assert_eq!(actual.len(), expected.len() as u32, "length");
+    for (i, b) in expected.iter().enumerate() {
+        assert_eq!(actual.get(i as u32).unwrap(), *b, "byte {}", i);
+    }
+}
+
+#[test]
+fn fill_confirmed_matches_golden_vector() {
+    let env = Env::default();
+    let h = BytesN::from_array(&env, &[0x11u8; 32]);
+    let mut solver_word = [0u8; 32];
+    let mut i = 12;
+    while i < 32 {
+        solver_word[i] = 0xAA;
+        i += 1;
+    }
+    let solver = BytesN::from_array(&env, &solver_word);
+    let b = crate::messages::encode_fill_confirmed(&env, &h, &solver, 1_000_000, 42);
+    assert_bytes_eq(&b, &decode_vector::<90>(FILL_CONFIRMED_GOLDEN));
+}
+
+#[test]
+fn cancel_intent_matches_golden_vector() {
+    let env = Env::default();
+    let h = BytesN::from_array(&env, &[0x22u8; 32]);
+    let b = crate::messages::encode_cancel_intent(&env, &h, CANCEL_REASON_EXPIRED);
+    assert_bytes_eq(&b, &decode_vector::<35>(CANCEL_INTENT_GOLDEN));
+}
