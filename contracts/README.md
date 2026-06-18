@@ -51,12 +51,13 @@ forge test
 
 Key functions (`src/PerihelionEscrow.sol`):
 
-| Function     | Purpose                                                       |
-| ------------ | ------------------------------------------------------------- |
-| `lock`       | Solver claims an intent, pulling the user's signed funds      |
-| `release`    | Endpoint-only; pay the solver after confirmed settlement      |
-| `refund`     | Return funds to the user after the deadline                   |
-| `hashIntent` | EIP-712 intent hash — identical to `@perihelion/sdk`          |
+| Function        | Purpose                                                                  |
+| --------------- | ------------------------------------------------------------------------ |
+| `lock`          | Solver claims an intent, pulling the user's signed funds and dispatching a FillInstruction to Stellar over LayerZero |
+| `lzReceive`     | Endpoint-only, peer-checked; releases to the solver on `FillConfirmed` or refunds the user on `CancelIntent` |
+| `cancelExpired` | Permissionless local-timeout refund once `deadline + confirmationGrace` passes |
+| `setPaused`     | Admin emergency halt — blocks new locks and local refunds (in-flight settlement still resolves) |
+| `hashIntent`    | EIP-712 intent hash — identical to `@perihelion/sdk`                      |
 
 > The EVM `DOMAIN_SEPARATOR` and `INTENT_TYPEHASH` are kept byte-for-byte
 > consistent with the SDK's `PERIHELION_DOMAIN` / `INTENT_TYPES` so an intent

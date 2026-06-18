@@ -140,6 +140,9 @@ contract PerihelionEscrowTest is Test {
     );
     event Released(bytes32 indexed intentHash, address indexed solver, uint256 amount);
     event Refunded(bytes32 indexed intentHash, address indexed user, uint256 amount);
+    event PausedSet(bool paused);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     function setUp() public {
         endpoint = new MockEndpoint();
@@ -223,6 +226,8 @@ contract PerihelionEscrowTest is Test {
         assertEq(escrow.stellarEid(), STELLAR_EID);
         assertEq(escrow.stellarPeer(), STELLAR_PEER);
         assertEq(escrow.owner(), owner);
+        assertEq(escrow.pendingOwner(), address(0));
+        assertFalse(escrow.paused());
         assertEq(escrow.confirmationGrace(), 2 hours);
     }
 
@@ -528,13 +533,109 @@ contract PerihelionEscrowTest is Test {
         escrow.setConfirmationGrace(1 hours);
     }
 
-    function test_TransferOwnership() public {
-        escrow.transferOwnership(solver);
-        assertEq(escrow.owner(), solver);
+    function test_RevertWhen_GraceExceedsCap() public {
+        uint256 tooLong = escrow.MAX_CONFIRMATION_GRACE() + 1;
+        vm.expectRevert(PerihelionEscrow.GraceTooLong.selector);
+        escrow.setConfirmationGrace(tooLong);
+    }
 
+    function test_SetConfirmationGraceAtCap() public {
+        escrow.setConfirmationGrace(escrow.MAX_CONFIRMATION_GRACE());
+        assertEq(escrow.confirmationGrace(), escrow.MAX_CONFIRMATION_GRACE());
+    }
+
+    // --- Pause ---------------------------------------------------------------
+
+    function test_SetPausedEmitsAndBlocksLock() public {
+        vm.expectEmit(false, false, false, true);
+        emit PausedSet(true);
+        escrow.setPaused(true);
+        assertTrue(escrow.paused());
+
+        PerihelionEscrow.Intent memory intent = _intent();
+        bytes memory sig = _sign(intent);
+        vm.prank(solver);
+        vm.expectRevert(PerihelionEscrow.EnforcedPause.selector);
+        escrow.lock{ value: 0.01 ether }(intent, sig);
+    }
+
+    function test_PauseBlocksCancelExpired() public {
+        bytes32 h = _lock();
+        escrow.setPaused(true);
+
+        PerihelionEscrow.Intent memory intent = _intent();
+        vm.warp(intent.deadline + escrow.confirmationGrace());
+        vm.expectRevert(PerihelionEscrow.EnforcedPause.selector);
+        escrow.cancelExpired(h);
+    }
+
+    /// @notice A pause must never strand in-flight funds: inbound settlement still
+    ///         releases to the solver while paused.
+    function test_PauseDoesNotBlockInboundRelease() public {
+        bytes32 h = _lock();
+        escrow.setPaused(true);
+
+        _confirm(h, solver, 1);
+        assertEq(token.balanceOf(solver), 100_000);
+    }
+
+    function test_Unpause() public {
+        escrow.setPaused(true);
+        escrow.setPaused(false);
+        assertFalse(escrow.paused());
+
+        // lock works again after unpause.
+        _lock();
+        assertEq(token.balanceOf(address(escrow)), 100_000);
+    }
+
+    function test_RevertWhen_SetPausedNotOwner() public {
+        vm.prank(solver);
+        vm.expectRevert(PerihelionEscrow.NotOwner.selector);
+        escrow.setPaused(true);
+    }
+
+    // --- Two-step ownership --------------------------------------------------
+
+    function test_TwoStepOwnershipTransfer() public {
+        vm.expectEmit(true, true, false, true);
+        emit OwnershipTransferStarted(owner, solver);
+        escrow.transferOwnership(solver);
+
+        // Not yet owner until accepted.
+        assertEq(escrow.owner(), owner);
+        assertEq(escrow.pendingOwner(), solver);
+
+        vm.expectEmit(true, true, false, true);
+        emit OwnershipTransferred(owner, solver);
+        vm.prank(solver);
+        escrow.acceptOwnership();
+
+        assertEq(escrow.owner(), solver);
+        assertEq(escrow.pendingOwner(), address(0));
+
+        // New owner has admin rights.
         vm.prank(solver);
         escrow.setPeer(bytes32(uint256(0xAA)));
         assertEq(escrow.stellarPeer(), bytes32(uint256(0xAA)));
+    }
+
+    function test_RevertWhen_AcceptByNonPending() public {
+        escrow.transferOwnership(solver);
+        vm.prank(address(0xBEEF));
+        vm.expectRevert(PerihelionEscrow.NotPendingOwner.selector);
+        escrow.acceptOwnership();
+    }
+
+    function test_OldOwnerKeepsControlUntilAccepted() public {
+        escrow.transferOwnership(solver);
+        // Old owner can still act, and can even cancel the handover.
+        escrow.transferOwnership(address(0));
+        assertEq(escrow.pendingOwner(), address(0));
+
+        vm.prank(solver);
+        vm.expectRevert(PerihelionEscrow.NotPendingOwner.selector);
+        escrow.acceptOwnership();
     }
 
     function test_RevertWhen_TransferOwnershipNotOwner() public {

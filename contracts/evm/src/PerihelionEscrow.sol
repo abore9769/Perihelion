@@ -60,6 +60,10 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     bytes1 private constant MSG_FILL_CONFIRMED = 0x02;
     bytes1 private constant MSG_CANCEL_INTENT = 0x03;
 
+    /// @notice Upper bound on `confirmationGrace`, so a misconfigured admin can
+    ///         never strand a user's local refund indefinitely.
+    uint256 public constant MAX_CONFIRMATION_GRACE = 7 days;
+
     // --- Immutable / config --------------------------------------------------
 
     /// @notice EIP-712 domain separator (name="Perihelion", version="1").
@@ -71,11 +75,17 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     /// @notice Protocol admin (peer/config management).
     address public owner;
+    /// @notice Pending owner in the two-step ownership handover (zero if none).
+    address public pendingOwner;
     /// @notice Trusted Stellar settlement OApp (32-byte LayerZero address).
     bytes32 public stellarPeer;
     /// @notice Extra delay beyond `deadline` before the local refund fallback opens,
     ///         giving an in-flight FillConfirmed time to land first (race guard).
     uint256 public confirmationGrace = 2 hours;
+    /// @notice Emergency halt. Blocks new `lock`s and local `cancelExpired` refunds;
+    ///         in-flight settlement still completes via `lzReceive` so funds are
+    ///         never stranded mid-flight. Mirrors the Soroban side's pause.
+    bool public paused;
 
     // --- State ---------------------------------------------------------------
 
@@ -98,6 +108,10 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     event Released(bytes32 indexed intentHash, address indexed solver, uint256 amount);
     event Refunded(bytes32 indexed intentHash, address indexed user, uint256 amount);
     event PeerSet(bytes32 peer);
+    event ConfirmationGraceSet(uint256 secondsGrace);
+    event PausedSet(bool paused);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     // --- Errors --------------------------------------------------------------
 
@@ -116,7 +130,11 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     error UnknownMessageType();
     error StaleNonce();
     error NotOwner();
+    error NotPendingOwner();
     error Reentrancy();
+    error EnforcedPause();
+    error GraceTooLong();
+    error ZeroAddress();
 
     // --- Modifiers -----------------------------------------------------------
 
@@ -132,12 +150,19 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         _;
     }
 
+    modifier whenNotPaused() {
+        if (paused) revert EnforcedPause();
+        _;
+    }
+
     // --- Constructor ---------------------------------------------------------
 
     constructor(address _endpoint, uint32 _stellarEid) {
+        if (_endpoint == address(0)) revert ZeroAddress();
         endpoint = ILayerZeroEndpoint(_endpoint);
         stellarEid = _stellarEid;
         owner = msg.sender;
+        emit OwnershipTransferred(address(0), msg.sender);
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
                 EIP712_DOMAIN_TYPEHASH,
@@ -155,14 +180,37 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         emit PeerSet(peer);
     }
 
-    /// @notice Tune the local-refund grace period.
+    /// @notice Tune the local-refund grace period. Capped so a misconfiguration
+    ///         can never push the user's refund window out indefinitely.
     function setConfirmationGrace(uint256 secondsGrace) external onlyOwner {
+        if (secondsGrace > MAX_CONFIRMATION_GRACE) revert GraceTooLong();
         confirmationGrace = secondsGrace;
+        emit ConfirmationGraceSet(secondsGrace);
     }
 
-    /// @notice Transfer ownership.
+    /// @notice Emergency halt / resume. Blocks new locks and local refunds; does
+    ///         not block inbound settlement so in-flight funds still resolve.
+    function setPaused(bool _paused) external onlyOwner {
+        paused = _paused;
+        emit PausedSet(_paused);
+    }
+
+    /// @notice Begin a two-step ownership handover. `newOwner` must call
+    ///         {acceptOwnership} to take effect; pass `address(0)` to cancel a
+    ///         pending handover.
     function transferOwnership(address newOwner) external onlyOwner {
-        owner = newOwner;
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    /// @notice Complete a pending ownership handover. Callable only by the
+    ///         address nominated in {transferOwnership}.
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner();
+        address previous = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(previous, owner);
     }
 
     // --- Lock ----------------------------------------------------------------
@@ -171,7 +219,12 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     ///         funds (measured-delta), and dispatch FillInstruction to Stellar.
     /// @dev `msg.value` funds the LayerZero send. The user must have approved
     ///      this contract for `sourceAmount` of `sourceAsset`.
-    function lock(Intent calldata intent, bytes calldata signature) external payable nonReentrant {
+    function lock(Intent calldata intent, bytes calldata signature)
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+    {
         if (block.timestamp >= intent.deadline) revert IntentExpired();
         if (intent.preferredSolver != address(0) && intent.preferredSolver != msg.sender) {
             revert ReservedForSolver();
@@ -263,7 +316,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @notice Permissionless local refund if no settlement landed within
     ///         `deadline + confirmationGrace`. Shares the terminal-flag guard with
     ///         the release path so exactly one terminal transition wins (I1/I2).
-    function cancelExpired(bytes32 intentHash) external nonReentrant {
+    function cancelExpired(bytes32 intentHash) external nonReentrant whenNotPaused {
         Lock storage l = locks[intentHash];
         if (l.user == address(0)) revert NotLocked();
         if (l.released || l.refunded) revert AlreadyFinalized();
