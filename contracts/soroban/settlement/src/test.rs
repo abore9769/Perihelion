@@ -401,3 +401,63 @@ fn cancel_intent_matches_golden_vector() {
     let b = crate::messages::encode_cancel_intent(&env, &h, CANCEL_REASON_EXPIRED);
     assert_bytes_eq(&b, &decode_vector::<35>(CANCEL_INTENT_GOLDEN));
 }
+
+// --- Lifecycle -> wire integration --------------------------------------------
+//
+// These run a full register -> fill / cancel lifecycle and assert the message it
+// dispatches is exactly what the EVM escrow will decode: `intent_hash` at offset
+// 2 and `solver_evm` at offset 34 are the fields PerihelionEscrow's decoders
+// read. Together with the EVM-side relay round trips, this closes the loop that
+// what Soroban emits is what the source chain consumes.
+
+#[test]
+fn fill_dispatches_evm_decodable_confirmation() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    let h = hash(&s.env, 1);
+    register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
+    let solver_evm = BytesN::from_array(&s.env, &[0xAB; 32]);
+    s.client.fill_intent(&solver, &solver_evm, &h, &250_000, &0);
+
+    let msg = s.mock.last().message;
+    assert_eq!(msg.len(), 90);
+    assert_eq!(msg.get(0).unwrap(), PROTOCOL_VERSION);
+    assert_eq!(msg.get(1).unwrap(), MSG_FILL_CONFIRMED);
+    let hb = h.to_array();
+    let sb = solver_evm.to_array();
+    for (i, (hbyte, sbyte)) in hb.iter().zip(sb.iter()).enumerate() {
+        let off = i as u32;
+        assert_eq!(msg.get(2 + off).unwrap(), *hbyte, "intent_hash byte {}", i);
+        assert_eq!(msg.get(34 + off).unwrap(), *sbyte, "solver_evm byte {}", i);
+    }
+}
+
+#[test]
+fn cancel_dispatches_evm_decodable_cancel() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let caller = Address::generate(&s.env);
+
+    let h = hash(&s.env, 2);
+    register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
+    s.env.ledger().with_mut(|li| li.timestamp = 6_000); // past deadline
+    s.client.cancel_expired_intent(&caller, &h, &0);
+
+    let msg = s.mock.last().message;
+    assert_eq!(msg.len(), 35);
+    assert_eq!(msg.get(0).unwrap(), PROTOCOL_VERSION);
+    assert_eq!(msg.get(1).unwrap(), MSG_CANCEL_INTENT);
+    let hb = h.to_array();
+    for (i, hbyte) in hb.iter().enumerate() {
+        assert_eq!(
+            msg.get(2 + i as u32).unwrap(),
+            *hbyte,
+            "intent_hash byte {}",
+            i
+        );
+    }
+    assert_eq!(msg.get(34).unwrap(), CANCEL_REASON_EXPIRED);
+}
