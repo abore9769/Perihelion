@@ -21,6 +21,9 @@ contracts/evm/cache/
 contracts/evm/broadcast/
 contracts/evm/lib/
 
+# Slither
+crytic-export/
+
 # Editor / OS
 .DS_Store
 .idea/

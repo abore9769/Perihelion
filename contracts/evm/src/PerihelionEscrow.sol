@@ -165,9 +165,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         emit OwnershipTransferred(address(0), msg.sender);
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
-                EIP712_DOMAIN_TYPEHASH,
-                keccak256(bytes("Perihelion")),
-                keccak256(bytes("1"))
+                EIP712_DOMAIN_TYPEHASH, keccak256(bytes("Perihelion")), keccak256(bytes("1"))
             )
         );
     }
@@ -239,8 +237,16 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         uint256 balBefore = IERC20(intent.sourceAsset).balanceOf(address(this));
         _safeTransferFrom(intent.sourceAsset, intent.user, address(this), intent.sourceAmount);
         uint256 received = IERC20(intent.sourceAsset).balanceOf(address(this)) - balBefore;
+        // Measured-delta off a balance diff after the pull is intentional; the
+        // exact-zero check rejects transfers that delivered nothing (e.g. a
+        // fully-taxed token). Safe under `nonReentrant`.
+        // slither-disable-next-line incorrect-equality,reentrancy-balance
         if (received == 0) revert NothingReceived();
 
+        // The lock is written after the pull because measured-delta needs the
+        // post-transfer balance; safe because `lock` and every fund-moving path
+        // are `nonReentrant`, so the token callback cannot re-enter them.
+        // slither-disable-next-line reentrancy-no-eth
         locks[intentHash] = Lock({
             solver: msg.sender,
             user: intent.user,
@@ -255,10 +261,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
         bytes memory message = _encodeFillInstruction(intentHash, intent, received);
         MessagingParams memory params = MessagingParams({
-            dstEid: stellarEid,
-            receiver: stellarPeer,
-            message: message,
-            nativeFee: msg.value
+            dstEid: stellarEid, receiver: stellarPeer, message: message, nativeFee: msg.value
         });
         endpoint.send{ value: msg.value }(params, msg.sender);
     }
