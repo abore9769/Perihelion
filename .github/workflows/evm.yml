@@ -61,4 +61,4 @@ jobs:
         run: pip install slither-analyzer
 
       - name: Analyze
-        run: slither src/PerihelionEscrow.sol --config-file slither.config.json
+        run: slither src/ --config-file slither.config.json

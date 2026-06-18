@@ -77,6 +77,10 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     address public owner;
     /// @notice Pending owner in the two-step ownership handover (zero if none).
     address public pendingOwner;
+    /// @notice Emergency guardian. May pause instantly during an incident, but
+    ///         cannot unpause or change any config — so it can be a hot key while
+    ///         `owner` is a timelock. Resuming always requires `owner`.
+    address public guardian;
     /// @notice Trusted Stellar settlement OApp (32-byte LayerZero address).
     bytes32 public stellarPeer;
     /// @notice Extra delay beyond `deadline` before the local refund fallback opens,
@@ -109,6 +113,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     event Refunded(bytes32 indexed intentHash, address indexed user, uint256 amount);
     event PeerSet(bytes32 peer);
     event ConfirmationGraceSet(uint256 secondsGrace);
+    event GuardianSet(address indexed guardian);
     event PausedSet(bool paused);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
@@ -131,6 +136,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     error StaleNonce();
     error NotOwner();
     error NotPendingOwner();
+    error NotAuthorized();
     error Reentrancy();
     error EnforcedPause();
     error GraceTooLong();
@@ -186,11 +192,27 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         emit ConfirmationGraceSet(secondsGrace);
     }
 
+    /// @notice Set (or clear) the emergency guardian. Owner-only.
+    function setGuardian(address newGuardian) external onlyOwner {
+        guardian = newGuardian;
+        emit GuardianSet(newGuardian);
+    }
+
     /// @notice Emergency halt / resume. Blocks new locks and local refunds; does
     ///         not block inbound settlement so in-flight funds still resolve.
     function setPaused(bool _paused) external onlyOwner {
         paused = _paused;
         emit PausedSet(_paused);
+    }
+
+    /// @notice Instant emergency pause, callable by the owner or the guardian.
+    ///         Unpausing always goes through the owner via {setPaused}, so a
+    ///         compromised guardian can at worst halt the protocol, never resume
+    ///         or reconfigure it.
+    function pause() external {
+        if (msg.sender != owner && msg.sender != guardian) revert NotAuthorized();
+        paused = true;
+        emit PausedSet(true);
     }
 
     /// @notice Begin a two-step ownership handover. `newOwner` must call

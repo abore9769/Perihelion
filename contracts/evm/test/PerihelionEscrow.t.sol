@@ -595,6 +595,45 @@ contract PerihelionEscrowTest is Test {
         escrow.setPaused(true);
     }
 
+    // --- Guardian ------------------------------------------------------------
+
+    function test_GuardianCanPauseButNotUnpause() public {
+        address guardian = address(0x6A);
+        escrow.setGuardian(guardian);
+        assertEq(escrow.guardian(), guardian);
+
+        // Guardian halts instantly.
+        vm.prank(guardian);
+        escrow.pause();
+        assertTrue(escrow.paused());
+
+        // But cannot resume (that path is owner-only).
+        vm.prank(guardian);
+        vm.expectRevert(PerihelionEscrow.NotOwner.selector);
+        escrow.setPaused(false);
+
+        // Owner resumes.
+        escrow.setPaused(false);
+        assertFalse(escrow.paused());
+    }
+
+    function test_OwnerCanAlsoCallPause() public {
+        escrow.pause();
+        assertTrue(escrow.paused());
+    }
+
+    function test_RevertWhen_RandomCallerPauses() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(PerihelionEscrow.NotAuthorized.selector);
+        escrow.pause();
+    }
+
+    function test_RevertWhen_SetGuardianNotOwner() public {
+        vm.prank(solver);
+        vm.expectRevert(PerihelionEscrow.NotOwner.selector);
+        escrow.setGuardian(address(0x6A));
+    }
+
     // --- Two-step ownership --------------------------------------------------
 
     function test_TwoStepOwnershipTransfer() public {

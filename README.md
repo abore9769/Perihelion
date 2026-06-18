@@ -296,6 +296,7 @@ See the [`sdk/` README](./sdk/README.md) for the full API.
 | [Technical Architecture](./docs/TECHNICAL-ARCHITECTURE.md)              | Full production spec: contracts, LayerZero V2, solver economics, security, testing, rollout |
 | [Architecture Overview](./docs/architecture.md)                         | High-level settlement flow and trust model                                  |
 | [Intent Specification](./docs/intent-spec.md)                           | The signable intent format and EIP-712 encoding                             |
+| [Deployment & Operations](./docs/deployment.md)                         | Production deployment, the timelock-multisig owner + guardian, and admin/incident runbooks |
 | [Glossary](./docs/glossary.md)                                          | Definitions of every protocol term                                          |
 | [FAQ](./docs/faq.md)                                                    | Common questions about safety, solvers, and trust                           |
 | [Contributing Guide](./CONTRIBUTING.md)                                 | How to contribute and where the work lives                                  |
