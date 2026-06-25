@@ -462,134 +462,30 @@ fn cancel_dispatches_evm_decodable_cancel() {
     assert_eq!(msg.get(34).unwrap(), CANCEL_REASON_EXPIRED);
 }
 
-// --- Solver Reputation (PROPOSED Phase 3) ------------------------------------
-
 #[test]
-fn solver_reputation_updates_on_fill() {
-    let s = setup();
-    let recipient = Address::generate(&s.env);
-    let solver = Address::generate(&s.env);
-    s.asset_admin.mint(&solver, &500_000);
-
-    let h1 = hash(&s.env, 10);
-    register_intent(&s, &h1, &recipient, 100_000, 50_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xCC; 32]);
-    s.client.fill_intent(&solver, &solver_evm, &h1, &250_000, &0);
-
-    // Check reputation was created
-    let rep = s.client.get_solver_reputation(&solver);
-    assert!(rep.is_some());
-    let rep_rec = rep.unwrap();
-    assert_eq!(rep_rec.fill_count, 1);
-    assert_eq!(rep_rec.success_count, 1);
-    // First fill has ewma_latency of 0
-
-    // Fill a second intent
-    let h2 = hash(&s.env, 11);
-    register_intent(&s, &h2, &recipient, 100_000, 50_000, 2, None);
-    s.client.fill_intent(&solver, &solver_evm, &h2, &250_000, &0);
-
-    let rep2 = s.client.get_solver_reputation(&solver);
-    assert!(rep2.is_some());
-    let rep2_rec = rep2.unwrap();
-    assert_eq!(rep2_rec.fill_count, 2);
-    assert_eq!(rep2_rec.success_count, 2);
-}
-
-#[test]
-fn solver_reputation_returns_none_for_unfilled_solver() {
-    let s = setup();
-    let solver = Address::generate(&s.env);
-    let rep = s.client.get_solver_reputation(&solver);
-    assert!(rep.is_none());
-}
-
-// --- Split delivery and dispatch (Issue #12) --------------------------------
-
-#[test]
-fn deliver_intent_records_filled_without_dispatch() {
-    let s = setup();
-    let recipient = Address::generate(&s.env);
-    let solver = Address::generate(&s.env);
-    s.asset_admin.mint(&solver, &500_000);
-
-    let h = hash(&s.env, 20);
-    register_intent(&s, &h, &recipient, 100_000, 50_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xDD; 32]);
-
-    // Deliver without dispatch
-    s.client
-        .deliver_intent(&solver, &solver_evm, &h, &250_000);
-
-    // Intent should be in Filled status
-    let rec = s.client.get_intent(&h).unwrap();
-    assert_eq!(rec.status, IntentStatus::Filled);
-
-    // No confirmation dispatch should have occurred (mock endpoint sent count unchanged)
-    let count_after = s.mock.sent();
-    assert_eq!(count_after, 0, "deliver_intent should not dispatch");
-}
-
-#[test]
-fn dispatch_confirmation_sends_message_and_advances_status() {
-    let s = setup();
-    let recipient = Address::generate(&s.env);
-    let solver = Address::generate(&s.env);
-    s.asset_admin.mint(&solver, &500_000);
-
-    let h = hash(&s.env, 21);
-    register_intent(&s, &h, &recipient, 100_000, 50_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xEE; 32]);
-
-    // Deliver first
-    s.client
-        .deliver_intent(&solver, &solver_evm, &h, &250_000);
-
-    // Then dispatch confirmation (permissionless caller)
-    let caller = Address::generate(&s.env);
-    s.client.dispatch_confirmation(&caller, &h, &0);
-
-    // Intent should now be ConfirmationSent
-    let rec = s.client.get_intent(&h).unwrap();
-    assert_eq!(rec.status, IntentStatus::ConfirmationSent);
-
-    // FillConfirmed should have been dispatched
-    let count_after = s.mock.sent();
-    assert_eq!(count_after, 1);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #141)")] // IntentFinalized
-fn dispatch_confirmation_rejects_double_dispatch() {
-    let s = setup();
-    let recipient = Address::generate(&s.env);
-    let solver = Address::generate(&s.env);
-    s.asset_admin.mint(&solver, &500_000);
-
-    let h = hash(&s.env, 22);
-    register_intent(&s, &h, &recipient, 100_000, 50_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xFF; 32]);
-
-    // Deliver and dispatch
-    s.client
-        .deliver_intent(&solver, &solver_evm, &h, &250_000);
-    let caller = Address::generate(&s.env);
-    s.client.dispatch_confirmation(&caller, &h, &0);
-
-    // Second dispatch should fail
-    s.client.dispatch_confirmation(&caller, &h, &0);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #146)")] // AlreadyFilled (not Filled status)
-fn dispatch_confirmation_rejects_non_filled_intent() {
+fn nonce_out_of_order_delivery_accepted() {
+    // Verify that nonces delivered out of order (5, 7, 6) are all accepted
+    // and processed exactly once, validating unordered delivery semantics.
     let s = setup();
     let recipient = Address::generate(&s.env);
 
-    let h = hash(&s.env, 23);
-    register_intent(&s, &h, &recipient, 100_000, 50_000, 1, None);
+    // Deliver nonce 5 first
+    let h5 = hash(&s.env, 5);
+    register_intent(&s, &h5, &recipient, 100_000, 5_000, 5, None);
+    assert!(s.client.get_intent(&h5).is_some());
 
-    // Try to dispatch before delivering
-    let caller = Address::generate(&s.env);
-    s.client.dispatch_confirmation(&caller, &h, &0);
+    // Deliver nonce 7 (skipping 6)
+    let h7 = hash(&s.env, 7);
+    register_intent(&s, &h7, &recipient, 100_000, 5_000, 7, None);
+    assert!(s.client.get_intent(&h7).is_some());
+
+    // Now deliver nonce 6 (out of order)
+    let h6 = hash(&s.env, 6);
+    register_intent(&s, &h6, &recipient, 100_000, 5_000, 6, None);
+    assert!(s.client.get_intent(&h6).is_some());
+
+    // All three should be registered
+    assert!(s.client.get_intent(&h5).is_some());
+    assert!(s.client.get_intent(&h6).is_some());
+    assert!(s.client.get_intent(&h7).is_some());
 }

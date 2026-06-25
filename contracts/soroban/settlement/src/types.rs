@@ -33,16 +33,12 @@ pub enum DataKey {
     Cancelled(BytesN<32>),
 
     // Persistent tier (transport bookkeeping).
-    /// Highest inbound LayerZero nonce processed for a source endpoint id.
-    InboundNonce(u32),
-
-    // Persistent tier (solver reputation — PROPOSED Phase 3).
-    /// Aggregate reputation record for a solver. Keyed by solver address.
-    SolverReputation(Address),
-
-    // Persistent tier (confirmation dispatch guard — Issue #12).
-    /// Marker set when FillConfirmed dispatch is initiated to prevent double-dispatch.
-    ConfirmationSent(BytesN<32>),
+    /// Consumed nonce bitmap for a source endpoint id (unordered delivery).
+    /// Tracks which nonces have been processed. The bitmap covers nonces in
+    /// the range [base, base + 63] where base is stored separately.
+    InboundNonceBitmap(u32),
+    /// Base nonce for the bitmap (nonce 0 before first message).
+    InboundNonceBase(u32),
 }
 
 /// Lifecycle state of a registered intent.
