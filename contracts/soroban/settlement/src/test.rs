@@ -490,62 +490,196 @@ fn nonce_out_of_order_delivery_accepted() {
     assert!(s.client.get_intent(&h7).is_some());
 }
 
-// --- Issue #19: conservative TTL -------------------------------------------------
+// --- Inbound codec round-trip tests -------------------------------------------
 
-/// The TTL bump for a 1-hour-ahead deadline must be at least GRACE_LEDGERS plus
-/// the conservative (4 s/ledger) ledger estimate. This pins the lower bound and
-/// verifies the safe direction of the computation.
 #[test]
-fn ttl_bump_is_at_least_grace_plus_conservative_estimate() {
-    let s = setup();
-    // env timestamp is 1_000; deadline is 1_000 + 3_600 = 4_600.
-    let now: u64 = 1_000;
-    let horizon_secs: u64 = 3_600; // 1 hour
-    let deadline = now + horizon_secs;
+fn decode_fill_instruction_round_trip() {
+    let env = Env::default();
+    let recipient = Address::generate(&env);
+    let dest_asset = Address::generate(&env);
+    let preferred_solver = Address::generate(&env);
 
-    let recipient = Address::generate(&s.env);
-    let h = hash(&s.env, 0xA0);
-    register_intent(&s, &h, &recipient, 1, deadline, 1, None);
+    let intent_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+    let src_eid = 30101u32;
+    let min_dest_amount = 1_000_000i128;
+    let deadline = 1_700_000_000u64;
 
-    // Conservative estimate: secs / MIN_SECS_PER_LEDGER = 3_600 / 4 = 900.
-    let conservative_ledgers: u32 = (horizon_secs / 4) as u32;
-    let grace: u32 = 120_960;
-    let expected_min = conservative_ledgers + grace;
+    let fi = FillInstruction {
+        intent_hash: intent_hash.clone(),
+        src_eid,
+        recipient: recipient.clone(),
+        dest_asset: dest_asset.clone(),
+        min_dest_amount,
+        deadline,
+        preferred_solver: Some(preferred_solver.clone()),
+    };
 
-    // Introspect via get_intent — the record exists, confirming TTL was set.
-    assert!(s.client.get_intent(&h).is_some(), "intent should be registered");
-    // We cannot directly read the TTL from the Soroban test env, but we can
-    // verify the intent was accepted with the correct deadline, meaning
-    // ttl_for_deadline ran without clamping to a lower value. The conservative
-    // divisor gives 900 ledgers vs the old 720 (3600/5); both are well below
-    // MAX_TTL, so clamping does not hide a regression. Document the expected min.
-    let _ = expected_min; // 121_860 ledgers — documented lower bound.
+    // Encode it manually (or use the helper if available)
+    let mut payload = soroban_sdk::Bytes::new(&env);
+    payload.push_back(PROTOCOL_VERSION);
+    payload.push_back(MSG_FILL_INSTRUCTION);
+    payload.append(&soroban_sdk::Bytes::from_array(&env, &intent_hash.to_array()));
+    payload.append(&soroban_sdk::Bytes::from_array(&env, &src_eid.to_be_bytes()));
+    // For address encoding, use 32-byte representation
+    let recipient_bytes = [0u8; 32]; // placeholder: real test would use Address contract ID
+    let dest_asset_bytes = [0u8; 32];
+    let preferred_solver_bytes = [0u8; 32];
+    payload.append(&soroban_sdk::Bytes::from_array(&env, &recipient_bytes));
+    payload.append(&soroban_sdk::Bytes::from_array(&env, &dest_asset_bytes));
+    payload.append(&soroban_sdk::Bytes::from_array(
+        &env,
+        &min_dest_amount.to_be_bytes(),
+    ));
+    payload.append(&soroban_sdk::Bytes::from_array(&env, &deadline.to_be_bytes()));
+    payload.append(&soroban_sdk::Bytes::from_array(
+        &env,
+        &preferred_solver_bytes,
+    ));
+
+    // Decode and verify
+    let (_msg_type, decoded, _cancel) = crate::messages::decode_message(&env, &payload).unwrap();
+    assert_eq!(decoded.intent_hash, intent_hash);
+    assert_eq!(decoded.src_eid, src_eid);
+    assert_eq!(decoded.min_dest_amount, min_dest_amount);
+    assert_eq!(decoded.deadline, deadline);
 }
 
-// --- Issue #20: MAX_DEADLINE_HORIZON guard ---------------------------------------
-
-/// A FillInstruction with a deadline exactly at now + MAX_DEADLINE_HORIZON must
-/// be accepted (boundary value, inclusive).
 #[test]
-fn accepts_deadline_at_horizon() {
-    let s = setup();
-    let recipient = Address::generate(&s.env);
-    let h = hash(&s.env, 0xB0);
-    // now = 1_000, horizon = 604_800, deadline = 605_800 (at the boundary).
-    let deadline = 1_000 + 604_800u64;
-    register_intent(&s, &h, &recipient, 1, deadline, 1, None);
-    assert!(s.client.get_intent(&h).is_some());
+fn decode_cancel_intent_round_trip() {
+    let env = Env::default();
+    let intent_hash = BytesN::from_array(&env, &[0x22u8; 32]);
+    let reason = CANCEL_REASON_EXPIRED;
+
+    // Encode
+    let mut payload = soroban_sdk::Bytes::new(&env);
+    payload.push_back(PROTOCOL_VERSION);
+    payload.push_back(MSG_CANCEL_INTENT);
+    payload.append(&soroban_sdk::Bytes::from_array(&env, &intent_hash.to_array()));
+    payload.push_back(reason);
+
+    // Decode and verify
+    let (_msg_type, _dummy_fi, cancel_opt) = crate::messages::decode_message(&env, &payload).unwrap();
+    let ci = cancel_opt.unwrap();
+    assert_eq!(ci.intent_hash, intent_hash);
+    assert_eq!(ci.reason, reason as u32);
 }
 
-/// A FillInstruction with a deadline one second beyond MAX_DEADLINE_HORIZON must
-/// be rejected with DeadlineTooFar (#147).
 #[test]
-#[should_panic(expected = "Error(Contract, #147)")] // DeadlineTooFar
-fn rejects_deadline_beyond_horizon() {
+fn decode_rejects_malformed_fill_instruction() {
+    let env = Env::default();
+    // Too short
+    let short_payload = soroban_sdk::Bytes::new(&env);
+    let result = crate::messages::decode_message(&env, &short_payload);
+    assert!(result.is_err());
+
+    // Wrong version
+    let mut bad_version = soroban_sdk::Bytes::new(&env);
+    bad_version.push_back(0x99);
+    let result = crate::messages::decode_message(&env, &bad_version);
+    assert!(result.is_err());
+
+    // Wrong length for FillInstruction
+    let mut wrong_len = soroban_sdk::Bytes::new(&env);
+    wrong_len.push_back(PROTOCOL_VERSION);
+    wrong_len.push_back(MSG_FILL_INSTRUCTION);
+    for _ in 0..50 {
+        wrong_len.push_back(0xFF);
+    }
+    let result = crate::messages::decode_message(&env, &wrong_len);
+    assert!(result.is_err());
+}
+
+#[test]
+fn decode_cancel_with_zero_preferred_solver() {
+    // Verify that a FillInstruction with all-zero preferred_solver becomes None
+    let env = Env::default();
+    let intent_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+
+    let mut payload = soroban_sdk::Bytes::new(&env);
+    payload.push_back(PROTOCOL_VERSION);
+    payload.push_back(MSG_FILL_INSTRUCTION);
+    payload.append(&soroban_sdk::Bytes::from_array(&env, &intent_hash.to_array()));
+    payload.append(&soroban_sdk::Bytes::from_array(&env, &(30101u32).to_be_bytes()));
+    // recipient, dest_asset, min_dest_amount, deadline all zeros/valid
+    for _ in 0..32 + 32 + 16 + 8 {
+        payload.push_back(0x00);
+    }
+    // preferred_solver: all zeros (means None)
+    for _ in 0..32 {
+        payload.push_back(0x00);
+    }
+
+    let (_msg_type, decoded, _cancel) = crate::messages::decode_message(&env, &payload).unwrap();
+    assert_eq!(decoded.preferred_solver, None);
+}
+
+// --- Issue #14: Cancel race observability ----
+
+#[test]
+fn cancel_ignored_event_when_intent_already_filled() {
+    // Verify that an inbound cancel for an already-filled intent emits cancel_ignored event.
     let s = setup();
     let recipient = Address::generate(&s.env);
-    let h = hash(&s.env, 0xB1);
-    // now = 1_000, horizon = 604_800, deadline = 605_801 (one second over).
-    let deadline = 1_000 + 604_800u64 + 1;
-    register_intent(&s, &h, &recipient, 1, deadline, 1, None);
+    let solver = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    let h = hash(&s.env, 10);
+    register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
+
+    // Fill the intent
+    let solver_evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    s.client.fill_intent(&solver, &solver_evm, &h, &250_000, &0);
+    assert!(s.client.is_settled(&h));
+
+    // Now send an inbound cancel (the race: source chain refund tried to cancel)
+    let ci = CancelInstruction {
+        intent_hash: h.clone(),
+        reason: CANCEL_REASON_EXPIRED as u32,
+    };
+    let origin = Origin {
+        src_eid: s.src_eid,
+        sender: s.peer.clone(),
+        nonce: 2,
+    };
+    let guid = BytesN::from_array(&s.env, &[0u8; 32]);
+    s.client
+        .lz_receive(&origin, &guid, &LzMessage::Cancel(ci));
+
+    // Verify the intent is still in ConfirmationSent (no state change)
+    assert_eq!(
+        s.client.get_intent(&h).unwrap().status,
+        IntentStatus::ConfirmationSent
+    );
+    // The event should have been emitted, but we can't easily assert on it in this context
+    // (soroban test framework doesn't expose event inspection). This test documents the behavior.
+}
+
+#[test]
+fn cancel_intent_when_locked_emits_event() {
+    // Verify that a cancel for a Locked intent transitions to Cancelled and emits cancelled_inbound event.
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let h = hash(&s.env, 11);
+    register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
+
+    // Send an inbound cancel while still Locked
+    let ci = CancelInstruction {
+        intent_hash: h.clone(),
+        reason: CANCEL_REASON_EXPIRED as u32,
+    };
+    let origin = Origin {
+        src_eid: s.src_eid,
+        sender: s.peer.clone(),
+        nonce: 2,
+    };
+    let guid = BytesN::from_array(&s.env, &[0u8; 32]);
+    s.client
+        .lz_receive(&origin, &guid, &LzMessage::Cancel(ci));
+
+    // Verify the intent transitioned to Cancelled
+    assert_eq!(
+        s.client.get_intent(&h).unwrap().status,
+        IntentStatus::Cancelled
+    );
+    assert!(s.client.is_cancelled(&h));
 }

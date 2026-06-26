@@ -31,8 +31,10 @@ pub enum DataKey {
     Settled(BytesN<32>),
     /// Terminal idempotency marker: set iff the intent was cancelled.
     Cancelled(BytesN<32>),
-    /// Marker: set once a FillConfirmed message has been dispatched for this intent.
+    /// Terminal idempotency marker: set iff the FillConfirmed was dispatched.
     ConfirmationSent(BytesN<32>),
+    /// Solver reputation metrics (Phase 3).
+    SolverReputation(Address),
 
     // Persistent tier (transport bookkeeping).
     /// Consumed nonce bitmap for a source endpoint id (unordered delivery).
