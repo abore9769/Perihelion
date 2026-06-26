@@ -238,10 +238,22 @@ impl Perihelion {
         }
 
         // Lazy-nonce replay guard (unordered delivery).
+        // NOTE: The eid-pause check is intentionally placed before nonce
+        // consumption. If a corridor is paused, the message is rejected without
+        // advancing the nonce, so it can be re-delivered once the corridor is
+        // unpaused. The global-pause check (if any) follows the same logic.
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedEid(origin.src_eid))
+            .unwrap_or(false)
+        {
+            return Err(PerihelionError::ContractPaused);
+        }
         Self::accept_nonce(&env, origin.src_eid, origin.nonce)?;
 
         match message {
-            LzMessage::FillInstruction(fi) => Self::on_fill_instruction(&env, fi),
+            LzMessage::FillInstruction(fi) => Self::on_fill_instruction(&env, origin.src_eid, fi),
             LzMessage::Cancel(ci) => Self::on_cancel_inbound(&env, ci),
         }
     }
@@ -586,6 +598,14 @@ impl Perihelion {
             .unwrap_or(false)
     }
 
+    /// Whether the given source-chain corridor is individually paused.
+    pub fn is_eid_paused(env: Env, eid: u32) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::PausedEid(eid))
+            .unwrap_or(false)
+    }
+
     /// PROPOSED Phase 3: Fetch aggregate reputation metrics for a solver.
     /// Returns None if the solver has never filled an intent.
     pub fn get_solver_reputation(env: Env, solver: Address) -> Option<SolverReputationRecord> {
@@ -617,6 +637,20 @@ impl Perihelion {
             .storage()
             .instance()
             .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(PerihelionError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Check neither the global pause nor the per-eid corridor pause.
+    fn require_eid_not_paused(env: &Env, eid: u32) -> Result<(), PerihelionError> {
+        Self::require_not_paused(env)?;
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedEid(eid))
             .unwrap_or(false)
         {
             return Err(PerihelionError::ContractPaused);
@@ -675,7 +709,15 @@ impl Perihelion {
         Ok(())
     }
 
-    fn on_fill_instruction(env: &Env, fi: FillInstruction) -> Result<(), PerihelionError> {
+    fn on_fill_instruction(env: &Env, transport_src_eid: u32, fi: FillInstruction) -> Result<(), PerihelionError> {
+        // The intent's return-path eid must equal the transport-authenticated
+        // origin eid. If they differ, a compromised or misconfigured adapter
+        // could declare a different src_eid in the body and route the eventual
+        // FillConfirmed/CancelIntent to a different chain than the one that
+        // actually locked the funds. We override fi.src_eid with the transport
+        // value rather than just asserting-equal so that adapters are not
+        // required to populate the field (they may leave it zero); the
+        // authoritative value is always the transport origin.
         let key = DataKey::Intent(fi.intent_hash.clone());
         // Idempotent: ignore re-delivery of a known or finalized intent.
         if Self::is_finalized(env, &fi.intent_hash) || env.storage().persistent().has(&key) {
@@ -726,7 +768,8 @@ impl Perihelion {
 
         let rec = IntentRecord {
             intent_hash: fi.intent_hash.clone(),
-            src_eid: fi.src_eid,
+            // Use transport_src_eid (authenticated) instead of fi.src_eid (body-declared).
+            src_eid: transport_src_eid,
             recipient: fi.recipient,
             dest_asset: fi.dest_asset,
             min_dest_amount: fi.min_dest_amount,
@@ -749,7 +792,7 @@ impl Perihelion {
 
         env.events().publish(
             (Symbol::new(env, "registered"), fi.intent_hash),
-            (fi.src_eid, fi.deadline),
+            (transport_src_eid, fi.deadline),
         );
         Ok(())
     }

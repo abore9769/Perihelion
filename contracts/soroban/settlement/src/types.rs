@@ -27,6 +27,10 @@ pub enum DataKey {
     Paused,
     /// Trusted remote OApp (the EVM escrow) per source endpoint id.
     Peer(u32),
+    /// Per-corridor pause flag. When set for an eid, all inbound and outbound
+    /// operations for that corridor are blocked independently of the global flag.
+    /// Allows quarantining a single compromised chain without halting others.
+    PausedEid(u32),
 
     // Persistent tier (per-intent lifecycle).
     Intent(BytesN<32>),
