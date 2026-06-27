@@ -85,6 +85,17 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @notice Upper bound on `confirmationGrace`, so a misconfigured admin can
     ///         never strand a user's local refund indefinitely.
     uint256 public constant MAX_CONFIRMATION_GRACE = 7 days;
+    /// @notice Lower bound on `confirmationGrace`. Must exceed worst-case cross-chain
+    ///         settlement latency (LayerZero relay + Stellar finality) so that
+    ///         `cancelExpired` cannot fire while a valid FillConfirmed is still in
+    ///         flight — which would refund the user after the solver has already
+    ///         delivered on Stellar, leaving the solver unrepaid.
+    uint256 public constant MIN_CONFIRMATION_GRACE = 30 minutes;
+
+    /// @dev Known cancel reason codes, mirroring the Soroban side.
+    uint8 private constant CANCEL_REASON_EXPIRED = 0x00;
+    uint8 private constant CANCEL_REASON_ADMIN   = 0x01;
+    uint8 private constant CANCEL_REASON_INVALID = 0x02;
 
     // --- Immutable / config --------------------------------------------------
 
@@ -133,9 +144,6 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         uint256 amount
     );
     event Released(bytes32 indexed intentHash, address indexed solver, uint256 amount);
-    /// @param reason  One of the CANCEL_REASON_* constants. Cross-chain cancels carry
-    ///                the reason byte from the Stellar message; local-timeout refunds
-    ///                use CANCEL_REASON_LOCAL_TIMEOUT (0xFF).
     event Refunded(bytes32 indexed intentHash, address indexed user, uint256 amount, uint8 reason);
     event PeerSet(bytes32 peer);
     event ConfirmationGraceSet(uint256 secondsGrace);
@@ -150,6 +158,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     error NotLocked();
     error InvalidSignature();
     error IntentExpired();
+    error WrongChain();
     error NotEndpoint();
     error UntrustedPeer();
     error ReservedForSolver();
@@ -166,6 +175,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     error Reentrancy();
     error EnforcedPause();
     error GraceTooLong();
+    error GraceTooShort();
+    error FeeTooLow();
     error ZeroAddress();
     error SourceChainMismatch();
 
@@ -215,10 +226,12 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         emit PeerSet(peer);
     }
 
-    /// @notice Tune the local-refund grace period. Capped so a misconfiguration
-    ///         can never push the user's refund window out indefinitely.
+    /// @notice Tune the local-refund grace period. Bounded by MIN_CONFIRMATION_GRACE
+    ///         (so a cancel cannot race an in-flight FillConfirmed) and
+    ///         MAX_CONFIRMATION_GRACE (so a misconfiguration cannot strand refunds).
     function setConfirmationGrace(uint256 secondsGrace) external onlyOwner {
         if (secondsGrace > MAX_CONFIRMATION_GRACE) revert GraceTooLong();
+        if (secondsGrace < MIN_CONFIRMATION_GRACE) revert GraceTooShort();
         confirmationGrace = secondsGrace;
         emit ConfirmationGraceSet(secondsGrace);
     }
@@ -268,8 +281,12 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     /// @notice Solver claims an intent: verify the user's signature, pull the
     ///         funds (measured-delta), and dispatch FillInstruction to Stellar.
-    /// @dev `msg.value` funds the LayerZero send. The user must have approved
-    ///      this contract for `sourceAmount` of `sourceAsset`.
+    /// @dev `msg.value` funds the LayerZero send. Call {quoteFee} to size it.
+    ///      The LayerZero endpoint is expected to refund any excess nativeFee to
+    ///      `msg.sender` (the refundAddress passed to endpoint.send); this is the
+    ///      standard V2 convention. Callers should still use {quoteFee} to minimise
+    ///      over-payment rather than relying on endpoint refunds.
+    ///      The user must have approved this contract for `sourceAmount` of `sourceAsset`.
     function lock(Intent calldata intent, bytes calldata signature)
         external
         payable
@@ -277,7 +294,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         whenNotPaused
     {
         if (block.timestamp >= intent.deadline) revert IntentExpired();
-        if (intent.sourceChainId != block.chainid) revert SourceChainMismatch();
+        // #39: bind intent to the chain the user signed for.
+        if (intent.sourceChainId != block.chainid) revert WrongChain();
         if (intent.preferredSolver != address(0) && intent.preferredSolver != msg.sender) {
             revert ReservedForSolver();
         }
@@ -317,6 +335,11 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         MessagingParams memory params = MessagingParams({
             dstEid: stellarEid, receiver: stellarPeer, message: message, nativeFee: msg.value
         });
+        // Revert early on obvious underpayment rather than letting the endpoint
+        // bubble an opaque error. Any excess is refunded by the endpoint to
+        // msg.sender per the LayerZero V2 convention.
+        uint256 quoted = endpoint.quote(params, msg.sender).nativeFee;
+        if (msg.value < quoted) revert FeeTooLow();
         endpoint.send{ value: msg.value }(params, msg.sender);
     }
 
@@ -390,10 +413,24 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
         l.refunded = true;
         _safeTransfer(l.asset, l.user, l.amount);
-        emit Refunded(intentHash, l.user, l.amount, CANCEL_REASON_LOCAL_TIMEOUT);
+        emit Refunded(intentHash, l.user, l.amount, CANCEL_REASON_EXPIRED);
     }
 
     // --- Views ---------------------------------------------------------------
+
+    /// @notice Quote the LayerZero native fee for a FillInstruction to Stellar.
+    ///         Solvers should call this off-chain and pass the result (with a small
+    ///         buffer) as `msg.value` to {lock}. Any excess is refunded by the
+    ///         endpoint to the caller per the LayerZero V2 convention.
+    function quoteFee(Intent calldata intent) external view returns (uint256 nativeFee) {
+        // Use a placeholder hash — the fee depends only on message size, not content.
+        bytes memory message =
+            _encodeFillInstruction(bytes32(0), intent, intent.sourceAmount);
+        MessagingParams memory params = MessagingParams({
+            dstEid: stellarEid, receiver: stellarPeer, message: message, nativeFee: 0
+        });
+        return endpoint.quote(params, msg.sender).nativeFee;
+    }
 
     /// @notice Compute the canonical EIP-712 intent hash (I5).
     function hashIntent(Intent calldata intent) public view returns (bytes32) {
@@ -465,6 +502,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     /// @dev Decode a 35-byte CancelIntent:
     ///      version(1)|type(1)|intent_hash(32)|reason(1).
+    ///      Rejects unknown reason codes to keep the wire contract strict.
     function _decodeCancelIntent(bytes calldata m)
         internal
         pure
@@ -477,6 +515,11 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         }
         intentHash = hashWord;
         reason = uint8(m[34]);
+        if (
+            reason != CANCEL_REASON_EXPIRED &&
+            reason != CANCEL_REASON_ADMIN &&
+            reason != CANCEL_REASON_INVALID
+        ) revert MalformedPayload();
     }
 
     // --- Internal: signature & token safety ----------------------------------

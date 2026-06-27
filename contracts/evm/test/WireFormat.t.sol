@@ -12,7 +12,7 @@ contract DecoderHarness is PerihelionEscrow {
         return _decodeFillConfirmed(m);
     }
 
-    function decodeCancelIntent(bytes calldata m) external pure returns (bytes32 intentHash, uint8 reason) {
+    function decodeCancelIntent(bytes calldata m) external pure returns (bytes32, uint8) {
         return _decodeCancelIntent(m);
     }
 }

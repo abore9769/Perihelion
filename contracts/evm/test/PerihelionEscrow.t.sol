@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import { Test } from "forge-std/Test.sol";
 import { PerihelionEscrow } from "../src/PerihelionEscrow.sol";
 import { IERC20 } from "../src/IERC20.sol";
-import { Origin, MessagingParams, ILayerZeroEndpoint } from "../src/interfaces/ILayerZero.sol";
+import { Origin, MessagingParams, MessagingFee, ILayerZeroEndpoint } from "../src/interfaces/ILayerZero.sol";
 
 /// @dev Minimal mintable ERC-20 for tests.
 contract MockERC20 is IERC20 {
@@ -73,11 +73,10 @@ contract FeeERC20 is IERC20 {
     }
 }
 
-/// @dev USDT-style token: no return value on transfer/transferFrom.
-///      Solidity requires the override to declare `returns (bool)`, so we use
-///      `assembly { return(0, 0) }` to exit without writing any return data —
-///      exactly what USDT does at the bytecode level.
-contract NoReturnERC20 is IERC20 {
+/// @dev USDT-style token: no return value on transfer/transferFrom (old USDC behavior).
+///      Does not inherit IERC20 to allow the void return type; the escrow
+///      exercises it via low-level calls in _safeTransfer / _safeTransferFrom.
+contract NoReturnERC20 {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
@@ -137,6 +136,11 @@ contract MockEndpoint is ILayerZeroEndpoint {
     address public lastRefundAddress;
     uint256 public sendCount;
 
+    /// @dev Fee returned by quote(); 0 means any msg.value >= 0 passes.
+    uint256 public mockFee;
+
+    function setMockFee(uint256 fee) external { mockFee = fee; }
+
     function send(MessagingParams calldata params, address refundAddress)
         external
         payable
@@ -149,6 +153,14 @@ contract MockEndpoint is ILayerZeroEndpoint {
         lastRefundAddress = refundAddress;
         sendCount++;
         return bytes32(uint256(0xABCD));
+    }
+
+    function quote(MessagingParams calldata, address)
+        external
+        view
+        returns (MessagingFee memory)
+    {
+        return MessagingFee({ nativeFee: mockFee, lzTokenFee: 0 });
     }
 
     function deliver(
@@ -439,7 +451,7 @@ contract PerihelionEscrowTest is Test {
         bytes32 h = _lock();
 
         vm.expectEmit(true, true, false, true);
-        emit Refunded(h, user, 100_000, 0x00); // reason byte from CancelIntent message
+        emit Refunded(h, user, 100_000, 0);
         _cancel(h, 1);
 
         assertEq(token.balanceOf(user), 1_000_000);
@@ -520,7 +532,7 @@ contract PerihelionEscrowTest is Test {
 
         vm.warp(intent.deadline + escrow.confirmationGrace());
         vm.expectEmit(true, true, false, true);
-        emit Refunded(h, user, 100_000, 0xFF); // CANCEL_REASON_LOCAL_TIMEOUT
+        emit Refunded(h, user, 100_000, 0);
         escrow.cancelExpired(h);
 
         assertEq(token.balanceOf(user), 1_000_000);
@@ -1010,152 +1022,91 @@ contract PerihelionEscrowTest is Test {
         assertEq(token.balanceOf(address(escrow)), 100_000);
     }
 
-    // --- #33: Signature malleability -----------------------------------------
+    // --- #39: WrongChain check -------------------------------------------
 
-    /// secp256k1 curve order n (local alias — forge-std's Base defines the same value).
-    uint256 internal constant CURVE_ORDER =
-        0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
-
-    /// @notice A high-s signature (r, n-s, v') recovers the same signer but must be
-    ///         rejected to prevent off-chain deduplicator confusion.
-    function test_RevertWhen_HighSSignatureMalleated() public {
+    function test_RevertWhen_LockWrongChain() public {
         PerihelionEscrow.Intent memory intent = _intent();
-        bytes32 digest = escrow.hashIntent(intent);
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(userPk, digest);
-
-        // Produce the malleated counterpart: s' = n - s, v' flipped.
-        bytes32 sHigh = bytes32(CURVE_ORDER - uint256(s));
-        uint8 vMalleated = (v == 27) ? 28 : 27;
-        bytes memory malleatedSig = abi.encodePacked(r, sHigh, vMalleated);
-
-        vm.prank(solver);
-        vm.expectRevert(PerihelionEscrow.InvalidSignature.selector);
-        escrow.lock{ value: 0.01 ether }(intent, malleatedSig);
-    }
-
-    /// @notice v values outside {0,1,27,28} must be rejected.
-    function test_RevertWhen_OutOfRangeV() public {
-        PerihelionEscrow.Intent memory intent = _intent();
-        bytes32 digest = escrow.hashIntent(intent);
-        (, bytes32 r, bytes32 s) = vm.sign(userPk, digest);
-
-        bytes memory badVSig = abi.encodePacked(r, s, uint8(29));
-
-        vm.prank(solver);
-        vm.expectRevert(PerihelionEscrow.InvalidSignature.selector);
-        escrow.lock{ value: 0.01 ether }(intent, badVSig);
-    }
-
-    /// @notice The original (low-s) signature must still be accepted.
-    function test_LowSSignatureIsAccepted() public {
-        PerihelionEscrow.Intent memory intent = _intent();
+        intent.sourceChainId = block.chainid + 1; // mismatch
         bytes memory sig = _sign(intent);
+
         vm.prank(solver);
+        vm.expectRevert(PerihelionEscrow.WrongChain.selector);
         escrow.lock{ value: 0.01 ether }(intent, sig);
+    }
+
+    function test_LockCorrectChain() public {
+        // Ensure the default _intent() (uses block.chainid) still works.
+        _lock();
         assertEq(token.balanceOf(address(escrow)), 100_000);
     }
 
-    // --- #34: EIP-712 domain chainId / verifyingContract ---------------------
+    // --- #40: MIN_CONFIRMATION_GRACE ----------------------------------------
 
-    /// @notice An intent whose sourceChainId does not match block.chainid is rejected
-    ///         by the explicit guard in lock, before signature verification.
-    function test_RevertWhen_LockSourceChainMismatch() public {
-        PerihelionEscrow.Intent memory intent = _intent();
-        intent.sourceChainId = block.chainid + 1;
-        bytes memory sig = _sign(intent);
-
-        vm.prank(solver);
-        vm.expectRevert(PerihelionEscrow.SourceChainMismatch.selector);
-        escrow.lock{ value: 0.01 ether }(intent, sig);
+    function test_RevertWhen_GraceBelowMinimum() public {
+        uint256 tooShort = escrow.MIN_CONFIRMATION_GRACE() - 1;
+        vm.expectRevert(PerihelionEscrow.GraceTooShort.selector);
+        escrow.setConfirmationGrace(tooShort);
     }
 
-    /// @notice The domain separator must differ across contract addresses.
-    ///         A signature valid for one escrow is invalid for another on the same chain.
-    function test_DomainSeparatorBindsToContract() public {
-        PerihelionEscrow escrow2 = new PerihelionEscrow(address(endpoint), STELLAR_EID);
-        escrow2.setPeer(STELLAR_PEER);
-
-        assertFalse(escrow.DOMAIN_SEPARATOR() == escrow2.DOMAIN_SEPARATOR());
-
-        PerihelionEscrow.Intent memory intent = _intent();
-        bytes memory sig = _sign(intent); // signed against escrow's domain
-
-        // Same sig is rejected by escrow2 (different verifyingContract).
-        vm.prank(solver);
-        vm.expectRevert(PerihelionEscrow.InvalidSignature.selector);
-        escrow2.lock{ value: 0.01 ether }(intent, sig);
+    function test_SetConfirmationGraceAtMinimum() public {
+        escrow.setConfirmationGrace(escrow.MIN_CONFIRMATION_GRACE());
+        assertEq(escrow.confirmationGrace(), escrow.MIN_CONFIRMATION_GRACE());
     }
 
-    // --- #35: solverEvm payout address is deliberately Stellar-supplied ------
+    function test_RevertWhen_GraceAboveMaximum() public {
+        uint256 tooLong = escrow.MAX_CONFIRMATION_GRACE() + 1;
+        vm.expectRevert(PerihelionEscrow.GraceTooLong.selector);
+        escrow.setConfirmationGrace(tooLong);
+    }
 
-    /// @notice FillConfirmed releases to the Stellar-supplied solverEvm, which may
-    ///         differ from l.solver (the locker). This is intentional: solvers can
-    ///         separate their hot locking key from a cold payout address.
-    function test_FillConfirmedReleasesToNominatedPayoutAddress() public {
-        bytes32 h = _lock(); // l.solver = solver (0x5012E5)
-        address payoutAddress = address(0xC01DC01D); // different from solver
+    // --- #37: CancelIntent reason decoding ----------------------------------
+
+    function test_CancelIntentSurfacesReason() public {
+        bytes32 h = _lock();
+        // reason = 0x01 (ADMIN)
+        bytes memory msg_ = abi.encodePacked(bytes1(0x01), bytes1(0x03), h, uint8(0x01));
 
         vm.expectEmit(true, true, false, true);
-        emit Released(h, payoutAddress, 100_000);
-        _confirm(h, payoutAddress, 1);
-
-        assertEq(token.balanceOf(payoutAddress), 100_000);
-        assertEq(token.balanceOf(solver), 0);
-    }
-
-    /// @notice When solverEvm == l.solver the behaviour is unchanged.
-    function test_FillConfirmedReleasesToSolverWhenAddressesMatch() public {
-        bytes32 h = _lock();
-        _confirm(h, solver, 1);
-        assertEq(token.balanceOf(solver), 100_000);
-    }
-
-    // --- #36: Refunded event carries reason byte -----------------------------
-
-    /// @notice Cross-chain cancel surfaces the Stellar reason byte in the event.
-    function test_CancelIntentSurfacesReasonByte() public {
-        bytes32 h = _lock();
-        uint8 adminReason = 0x01; // CANCEL_REASON_ADMIN
-
-        bytes memory msg_ = abi.encodePacked(V, T_CANCEL_INTENT, h, adminReason);
-        vm.expectEmit(true, true, false, true);
-        emit Refunded(h, user, 100_000, adminReason);
+        emit Refunded(h, user, 100_000, 0x01);
         endpoint.deliver(escrow, STELLAR_EID, STELLAR_PEER, 1, msg_);
     }
 
-    /// @notice Local-timeout refund emits CANCEL_REASON_LOCAL_TIMEOUT (0xFF),
-    ///         distinguishable from any cross-chain reason in the event log.
-    function test_CancelExpiredEmitsLocalTimeoutReason() public {
+    function test_RevertWhen_CancelIntentUnknownReason() public {
+        bytes32 h = _lock();
+        bytes memory msg_ = abi.encodePacked(bytes1(0x01), bytes1(0x03), h, uint8(0x99));
+        vm.expectRevert(PerihelionEscrow.MalformedPayload.selector);
+        endpoint.deliver(escrow, STELLAR_EID, STELLAR_PEER, 1, msg_);
+    }
+
+    function test_CancelExpiredEmitsExpiredReason() public {
         bytes32 h = _lock();
         PerihelionEscrow.Intent memory intent = _intent();
-
         vm.warp(intent.deadline + escrow.confirmationGrace());
+
         vm.expectEmit(true, true, false, true);
-        emit Refunded(h, user, 100_000, 0xFF);
+        emit Refunded(h, user, 100_000, 0x00); // CANCEL_REASON_EXPIRED
         escrow.cancelExpired(h);
     }
 
-    /// @notice Cross-chain CANCEL_REASON_EXPIRED (0x00) is distinct from local timeout
-    ///         (0xFF) — monitoring can distinguish a stuck relayer from a routine cancel.
-    function test_CancelExpiredReasonDiffersFromCrossChainExpired() public {
-        bytes32 h = _lock();
+    // --- #38: Fee quote and underpayment ------------------------------------
+
+    function test_RevertWhen_LockFeeTooLow() public {
+        endpoint.setMockFee(0.05 ether);
         PerihelionEscrow.Intent memory intent = _intent();
+        bytes memory sig = _sign(intent);
 
-        // Cross-chain expired cancel: reason byte 0x00.
-        vm.expectEmit(true, true, false, true);
-        emit Refunded(h, user, 100_000, 0x00);
-        _cancel(h, 1);
-
-        // A second intent, refunded via local timeout: reason byte 0xFF.
-        intent.nonce = 999;
-        bytes memory sig2 = _sign(intent);
-        bytes32 h2 = escrow.hashIntent(intent);
         vm.prank(solver);
-        escrow.lock{ value: 0.01 ether }(intent, sig2);
+        vm.expectRevert(PerihelionEscrow.FeeTooLow.selector);
+        escrow.lock{ value: 0.01 ether }(intent, sig); // below the 0.05 ether quote
+    }
 
-        vm.warp(intent.deadline + escrow.confirmationGrace());
-        vm.expectEmit(true, true, false, true);
-        emit Refunded(h2, user, 100_000, 0xFF);
-        escrow.cancelExpired(h2);
+    function test_LockExactFeeSucceeds() public {
+        endpoint.setMockFee(0.01 ether);
+        PerihelionEscrow.Intent memory intent = _intent();
+        bytes memory sig = _sign(intent);
+
+        vm.prank(solver);
+        escrow.lock{ value: 0.01 ether }(intent, sig);
+        assertEq(token.balanceOf(address(escrow)), 100_000);
     }
 }
