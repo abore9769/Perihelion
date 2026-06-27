@@ -5,9 +5,10 @@
  * poll (or `await`) until it settles.
  */
 
-import type { WalletClient } from "viem";
-import { hashIntent, INTENT_TYPES, PERIHELION_DOMAIN } from "./intent.js";
+import type { TypedDataDomain, WalletClient } from "viem";
+import { hashIntent, INTENT_TYPES, perihelionDomain } from "./intent.js";
 import type {
+  Address,
   Hex,
   Intent,
   IntentRecord,
@@ -17,6 +18,10 @@ import type {
 export interface ClientOptions {
   /** Base URL of the Perihelion mempool / relayer API. */
   readonly mempoolUrl: string;
+  /** Chain ID of the EVM network the escrow is deployed on. */
+  readonly chainId: number;
+  /** Address of the PerihelionEscrow contract. */
+  readonly verifyingContract: Address;
   /** Override the fetch implementation (defaults to global `fetch`). */
   readonly fetch?: typeof fetch;
 }
@@ -25,10 +30,12 @@ export interface ClientOptions {
 export class PerihelionClient {
   private readonly base: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly domain: TypedDataDomain;
 
   constructor(opts: ClientOptions) {
     this.base = opts.mempoolUrl.replace(/\/$/, "");
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
+    this.domain = perihelionDomain(opts.chainId, opts.verifyingContract);
   }
 
   /** Sign an intent with a viem wallet, producing a {@link SignedIntent}. */
@@ -40,7 +47,7 @@ export class PerihelionClient {
     if (!account) throw new Error("wallet client has no account");
     const signature = (await wallet.signTypedData({
       account,
-      domain: PERIHELION_DOMAIN,
+      domain: this.domain,
       types: INTENT_TYPES,
       primaryType: "Intent",
       message: {
@@ -56,7 +63,7 @@ export class PerihelionClient {
         preferredSolver: intent.preferredSolver,
       },
     })) as Hex;
-    return { intent, signature, hash: hashIntent(intent) };
+    return { intent, signature, hash: hashIntent(intent, this.domain) };
   }
 
   /** Submit a signed intent to the mempool. Returns its hash (id). */

@@ -14,11 +14,20 @@ import {
 } from "viem";
 import type { Address, Hex, Intent } from "./types.js";
 
-/** EIP-712 domain for Perihelion intents. */
-export const PERIHELION_DOMAIN: TypedDataDomain = {
-  name: "Perihelion",
-  version: "1",
-};
+/**
+ * Build the EIP-712 domain for a specific Perihelion escrow deployment.
+ *
+ * Both `chainId` and `verifyingContract` are required: the on-chain domain
+ * separator includes them (EIP-712 §4), so omitting either would cause
+ * signature mismatches — and, more critically, would allow cross-chain or
+ * cross-contract signature replay (Perihelion security issue #34).
+ *
+ * @param chainId          Chain ID of the EVM network the escrow is deployed on.
+ * @param verifyingContract Address of the PerihelionEscrow contract.
+ */
+export function perihelionDomain(chainId: number, verifyingContract: Address): TypedDataDomain {
+  return { name: "Perihelion", version: "1", chainId, verifyingContract };
+}
 
 /** EIP-712 type definition for an {@link Intent}. */
 export const INTENT_TYPES = {
@@ -82,23 +91,34 @@ export function buildIntent(params: IntentParams, options?: BuildOptions): Inten
   return intent;
 }
 
-/** Compute the EIP-712 hash that uniquely identifies an intent. */
-export function hashIntent(intent: Intent): Hex {
+/**
+ * Compute the EIP-712 hash that uniquely identifies an intent.
+ *
+ * @param domain  Must be built with {@link perihelionDomain} — i.e. it must
+ *                include `chainId` and `verifyingContract` so the hash is
+ *                bound to a specific chain and escrow deployment.
+ */
+export function hashIntent(intent: Intent, domain: TypedDataDomain): Hex {
   return hashTypedData({
-    domain: PERIHELION_DOMAIN,
+    domain,
     types: INTENT_TYPES,
     primaryType: "Intent",
     message: toMessage(intent),
   });
 }
 
-/** Recover the signer of an intent and check it matches `intent.user`. */
+/**
+ * Recover the signer of an intent and check it matches `intent.user`.
+ *
+ * @param domain  Must be built with {@link perihelionDomain}.
+ */
 export async function verifyIntent(
   intent: Intent,
   signature: Hex,
+  domain: TypedDataDomain,
 ): Promise<boolean> {
   const recovered = await recoverTypedDataAddress({
-    domain: PERIHELION_DOMAIN,
+    domain,
     types: INTENT_TYPES,
     primaryType: "Intent",
     message: toMessage(intent),

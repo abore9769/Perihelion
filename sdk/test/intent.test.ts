@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { privateKeyToAccount } from "viem/accounts";
 import { createWalletClient, http, zeroAddress } from "viem";
-import { mainnet } from "viem/chains";
-import { buildIntent, DEFAULT_V_MIN, hashIntent, verifyIntent } from "../src/intent.js";
+import { base } from "viem/chains";
+import { buildIntent, DEFAULT_V_MIN, hashIntent, perihelionDomain, verifyIntent } from "../src/intent.js";
 import { PerihelionClient } from "../src/client.js";
 
 const PK = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 const account = privateKeyToAccount(PK);
+
+// Sample escrow deployment on Base (chain 8453).
+const CHAIN_ID = 8453;
+const CONTRACT_ADDRESS = "0x1234567890123456789012345678901234567890" as const;
+const DOMAIN = perihelionDomain(CHAIN_ID, CONTRACT_ADDRESS);
 
 function sampleIntent() {
   return buildIntent({
@@ -30,19 +35,32 @@ test("buildIntent defaults open solver and keeps explicit nonce", () => {
 });
 
 test("hashIntent is deterministic", () => {
-  assert.equal(hashIntent(sampleIntent()), hashIntent(sampleIntent()));
+  assert.equal(hashIntent(sampleIntent(), DOMAIN), hashIntent(sampleIntent(), DOMAIN));
+});
+
+test("hashIntent differs across chains and contracts", () => {
+  const intent = sampleIntent();
+  const domainA = perihelionDomain(8453, "0x1111111111111111111111111111111111111111");
+  const domainB = perihelionDomain(1, "0x1111111111111111111111111111111111111111");
+  const domainC = perihelionDomain(8453, "0x2222222222222222222222222222222222222222");
+  assert.notEqual(hashIntent(intent, domainA), hashIntent(intent, domainB));
+  assert.notEqual(hashIntent(intent, domainA), hashIntent(intent, domainC));
 });
 
 test("verifyIntent accepts a valid signature and rejects a tampered intent", async () => {
   const intent = sampleIntent();
-  const client = new PerihelionClient({ mempoolUrl: "http://localhost" });
-  const wallet = createWalletClient({ account, chain: mainnet, transport: http() });
+  const client = new PerihelionClient({
+    mempoolUrl: "http://localhost",
+    chainId: CHAIN_ID,
+    verifyingContract: CONTRACT_ADDRESS,
+  });
+  const wallet = createWalletClient({ account, chain: base, transport: http() });
 
   const signed = await client.signIntent(wallet, intent);
-  assert.equal(await verifyIntent(intent, signed.signature), true);
+  assert.equal(await verifyIntent(intent, signed.signature, DOMAIN), true);
 
   const tampered = { ...intent, sourceAmount: "2000000" };
-  assert.equal(await verifyIntent(tampered, signed.signature), false);
+  assert.equal(await verifyIntent(tampered, signed.signature, DOMAIN), false);
 });
 
 test("buildIntent warns when sourceAmount is below V_min", () => {

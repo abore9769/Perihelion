@@ -5,7 +5,11 @@
  * ```ts
  * import { PerihelionClient, buildIntent } from "@perihelion/sdk";
  *
- * const client = new PerihelionClient({ mempoolUrl: "https://mempool.perihelion.xyz" });
+ * const client = new PerihelionClient({
+ *   mempoolUrl: "https://mempool.perihelion.xyz",
+ *   chainId: 8453,
+ *   verifyingContract: "0xYourEscrowAddress",
+ * });
  * const intent = buildIntent({
  *   user: "0xabc...",
  *   destination: "GUSER...STELLAR",
